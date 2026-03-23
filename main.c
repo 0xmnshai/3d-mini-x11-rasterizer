@@ -1,4 +1,3 @@
-
 #include <X11/X.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -13,6 +12,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <pthread.h>
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -24,7 +25,10 @@ static int g_width = INITIAL_WIDTH;
 static int g_height = INITIAL_HEIGHT;
 
 #define MAX_COMMANDS 1024 * 4
-#define RING_SIZE 1024 * 8
+#define RING_BUFFER_SIZE 1024 * 4
+#define GPU_VRAM_SIZE 1024 * 1024 * 64
+
+typedef uint32_t gpu_addr_t;
 
 typedef struct {
   float x, y, z, w;
@@ -121,28 +125,64 @@ void resize_buffers(Display *display, Visual *visual, int w, int h) {
   g_width = w;
   g_height = h;
 
-  g_frame_buffer = malloc(w * h * sizeof(uint32_t));
-  g_depth_buffer = malloc(w * h * sizeof(float));
+  g_frame_buffer = (uint32_t *)malloc(w * h * sizeof(uint32_t));
+  g_depth_buffer = (float *)malloc(w * h * sizeof(float));
+
+  // g_ximage = XCreateImage(display, visual, 24, ZPixmap, 0,
+  //                         (char *)g_frame_buffer, w, h, 32, 0);
 
   g_ximage = XCreateImage(display, visual, 24, ZPixmap, 0,
                           (char *)g_frame_buffer, w, h, 32, 0);
 }
 
-typedef enum { OP_DRAW, OP_CLEAR } OpCode;
+typedef enum {
+  GPU_OP_NOP = 0,
+  GPU_OP_CLEAR_COLOR = 1,
+  GPU_OP_CLEAR_DEPTH = 2,
+  GPU_OP_LOAD_VP_MATRIX = 3,
+  GPU_OP_DRAW_PRIMITIVES = 4,
+  GPU_OP_BIND_VBO = 5,
+  GPI_OP_DRAW = 6
+} gpu_opcode_t;
 
 typedef struct {
-  OpCode op_code;
+  gpu_opcode_t op_code;
   Vertex *vertices;
   uint32_t count;
   Mat4 mvp;
 } gpu_command;
 
 typedef struct {
+  gpu_opcode_t op_code;
+  uint32_t arg0;
+  uint32_t arg1;
+  float f_arg[16];
+} gpu_packet_t;
+
+typedef struct {
+  uint32_t *framebuffer;
+  float *depthbuffer;
+  uint8_t *vram;
+  gpu_packet_t ring_buffer[RING_BUFFER_SIZE];
+  uint32_t read_ptr;
+  uint32_t write_ptr;
+
+  Mat4 view_proj;
+  gpu_addr_t bound_vbo;
+} gpu_hardware_t;
+
+typedef struct {
   gpu_command commands[1024];
   int count;
 } command_buffer;
 
-void gpu_rasterize_triangle(Vertex v0, Vertex v1, Vertex v2) {
+gpu_hardware_t g_gpu;
+
+static float edge_func(Vec4 a, Vec4 b, Vec4 c) {
+  return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
+}
+
+void gpu_rasterize(Vertex v0, Vertex v1, Vertex v2) {
   int min_x = fmax(0, floor(fmin(v0.pos.x, fmin(v1.pos.x, v2.pos.x))));
   int min_y = fmax(0, floor(fmin(v0.pos.y, fmin(v1.pos.y, v2.pos.y))));
   int max_x = fmin(g_width, ceil(fmax(v0.pos.x, fmax(v1.pos.x, v2.pos.x))));
@@ -187,13 +227,93 @@ void gpu_rasterize_triangle(Vertex v0, Vertex v1, Vertex v2) {
   }
 }
 
+void gpu_hw_rasterize(Vec4 v0, Vec4 v1, Vec4 v2, uint32_t color) {
+  // 1. Viewport Transform
+  Vec4 p0 = {(v0.x / v0.w + 1) * 0.5f * g_width,
+             (1 - (v0.y / v0.w + 1) * 0.5f) * g_height, v0.z / v0.w, 1};
+  Vec4 p1 = {(v1.x / v1.w + 1) * 0.5f * g_width,
+             (1 - (v1.y / v1.w + 1) * 0.5f) * g_height, v1.z / v1.w, 1};
+  Vec4 p2 = {(v2.x / v2.w + 1) * 0.5f * g_width,
+             (1 - (v2.y / v2.w + 1) * 0.5f) * g_height, v2.z / v2.w, 1};
+
+  // 2. Bounding Box
+  int minX = fmax(0, floor(fmin(p0.x, fmin(p1.x, p2.x))));
+  int maxX = fmin(g_width - 1, ceil(fmax(p0.x, fmax(p1.x, p2.x))));
+  int minY = fmax(0, floor(fmin(p0.y, fmin(p1.y, p2.y))));
+  int maxY = fmin(g_height - 1, ceil(fmax(p0.y, fmax(p1.y, p2.y))));
+
+  float area = edge_func(p0, p1, p2);
+  if (area <= 0)
+    return; // Backface culling
+
+  for (int y = minY; y <= maxY; y++) {
+    for (int x = minX; x <= maxX; x++) {
+      Vec4 p = {x + 0.5f, y + 0.5f, 0, 0};
+      float w0 = edge_func(p1, p2, p) / area;
+      float w1 = edge_func(p2, p0, p) / area;
+      float w2 = edge_func(p0, p1, p) / area;
+
+      if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+        float z = w0 * p0.z + w1 * p1.z + w2 * p2.z;
+        if (z < g_gpu.depthbuffer[y * g_width + x]) {
+          g_gpu.depthbuffer[y * g_width + x] = z;
+          g_gpu.framebuffer[y * g_width + x] = color;
+        }
+      }
+    }
+  }
+}
+
+void *gpu_worker_thread(void *arg) {
+  while (1) {
+    if (g_gpu.read_ptr != g_gpu.write_ptr) {
+      gpu_packet_t pkt = g_gpu.ring_buffer[g_gpu.read_ptr];
+
+      switch (pkt.op_code) {
+      case GPU_OP_CLEAR_COLOR:
+        for (int i = 0; i < g_width * g_height; i++)
+          g_gpu.framebuffer[i] = pkt.arg0;
+        break;
+      case GPU_OP_CLEAR_DEPTH:
+        for (int i = 0; i < g_width * g_height; i++)
+          g_gpu.depthbuffer[i] = 1.0f;
+        break;
+      case GPU_OP_LOAD_VP_MATRIX:
+        memcpy(&g_gpu.view_proj, pkt.f_arg, sizeof(Mat4));
+        break;
+      case GPU_OP_BIND_VBO:
+        g_gpu.bound_vbo = pkt.arg0;
+        break;
+      case GPU_OP_DRAW_PRIMITIVES: {
+        float *vdata = (float *)(g_gpu.vram + g_gpu.bound_vbo);
+        for (uint32_t i = 0; i < pkt.arg0; i += 3) {
+          Vec4 v[3];
+          for (int j = 0; j < 3; j++) {
+            Vec4 raw = {vdata[(i + j) * 3 + 0], vdata[(i + j) * 3 + 1],
+                        vdata[(i + j) * 3 + 2], 1.0f};
+            v[j] = mat4_mul_vec4(g_gpu.view_proj, raw);
+          }
+          gpu_hw_rasterize(v[0], v[1], v[2], pkt.arg1);
+        }
+      } break;
+      default:
+        break;
+      }
+      g_gpu.read_ptr = (g_gpu.read_ptr + 1) % RING_BUFFER_SIZE;
+    } else {
+      usleep(100); // Wait for doorbell
+    }
+  }
+  return NULL;
+}
+
 void gpu_process_commands(gpu_command *ring_buffer, int count) {
   for (int i = 0; i < count; i++) {
     gpu_command cmd = ring_buffer[i];
 
-    if (cmd.op_code == OP_CLEAR) {
+    if (cmd.op_code == GPU_OP_CLEAR_COLOR) {
       // memset(g_frame_buffer, 0x11, g_width * g_height * sizeof(uint32_t));
-      
+
       uint8_t r = (uint8_t)(g_clear_color.r * 255.0f);
       uint8_t g = (uint8_t)(g_clear_color.g * 255.0f);
       uint8_t b = (uint8_t)(g_clear_color.b * 255.0f);
@@ -204,7 +324,7 @@ void gpu_process_commands(gpu_command *ring_buffer, int count) {
       for (int i = 0; i < g_height * g_width; i++)
         g_depth_buffer[i] = 1.0f;
 
-    } else if (cmd.op_code == OP_DRAW) {
+    } else if (cmd.op_code == GPI_OP_DRAW) {
       for (uint32_t j = 0; j < cmd.count; j += 3) {
         Vertex tri[3];
 
@@ -222,7 +342,7 @@ void gpu_process_commands(gpu_command *ring_buffer, int count) {
           tri[k].color = v.color;
         }
 
-        gpu_rasterize_triangle(tri[0], tri[1], tri[2]);
+        gpu_rasterize(tri[0], tri[1], tri[2]);
       }
     }
   }
@@ -234,11 +354,65 @@ void kernel_submit_buffer(command_buffer *cmd) {
   cmd->count = 0;
 }
 
+void kernel_submit_ioctl(gpu_packet_t *user_packets, uint32_t count) {
+  for (uint32_t i = 0; i < count; i++) {
+    if (user_packets[i].op_code == GPU_OP_BIND_VBO &&
+        user_packets[i].arg0 > GPU_VRAM_SIZE) {
+      printf("Kernel Panic: Illegal VRAM Access Attempt!\n");
+      return;
+    }
+    g_gpu.ring_buffer[g_gpu.write_ptr] = user_packets[i];
+    g_gpu.write_ptr = (g_gpu.write_ptr + 1) % RING_BUFFER_SIZE;
+  }
+}
+
+typedef struct {
+  gpu_packet_t batch[128];
+  uint32_t batch_count;
+} driver_context_t;
+
+driver_context_t g_driver;
+
 static command_buffer g_command_buffer;
 static Mat4 g_current_mvp;
 
+void glFlush() { kernel_submit_buffer(&g_command_buffer); }
+
+void driver_flush() {
+  kernel_submit_ioctl(g_driver.batch, g_driver.batch_count);
+  g_driver.batch_count = 0;
+}
+
+void driver_emit(gpu_opcode_t op, uint32_t a0, uint32_t a1, float *fptr,
+                 int fsize) {
+  gpu_packet_t *p = &g_driver.batch[g_driver.batch_count++];
+  p->op_code = op;
+  p->arg0 = a0;
+  p->arg1 = a1;
+  if (fptr)
+    memcpy(p->f_arg, fptr, fsize);
+  if (g_driver.batch_count >= 120)
+    driver_flush();
+}
+
+uint32_t glGenBuffers() {
+  static uint32_t vram_ptr = 0;
+  uint32_t handle = vram_ptr;
+  vram_ptr += 1024 * 64; // Allocate block
+  return handle;
+}
+
+void glBufferData(uint32_t handle, void *data, size_t size) {
+  memcpy(g_gpu.vram + handle, data, size);
+}
+
+void glBindBuffer(uint32_t handle) {
+  driver_emit(GPU_OP_BIND_VBO, handle, 0, NULL, 0);
+}
+
 void glClear() {
-  g_command_buffer.commands[g_command_buffer.count++].op_code = OP_CLEAR;
+  g_command_buffer.commands[g_command_buffer.count++].op_code =
+      GPU_OP_CLEAR_COLOR;
 }
 
 void glClearColor(float r, float g, float b) {
@@ -247,18 +421,32 @@ void glClearColor(float r, float g, float b) {
   g_clear_color.b = b;
 }
 
+// void glClearColor(uint32_t hex) {
+//   driver_emit(GPU_OP_CLEAR_COLOR, hex, 0, NULL, 0);
+//   driver_emit(GPU_OP_CLEAR_DEPTH, 0, 0, NULL, 0);
+// }
+
 void glDrawArrays(Vertex *verts, uint32_t count) {
   gpu_command *cmd = &g_command_buffer.commands[g_command_buffer.count++];
 
-  cmd->op_code = OP_DRAW;
+  cmd->op_code = GPI_OP_DRAW;
   cmd->vertices = verts;
   cmd->count = count;
   cmd->mvp = g_current_mvp;
 }
 
-void glFlush() { kernel_submit_buffer(&g_command_buffer); }
+// void glDrawArrays(uint32_t count, uint32_t color) {
+//   driver_emit(GPU_OP_DRAW_PRIMITIVES, count, color, NULL, 0);
+// }
 
 int main() {
+
+  g_gpu.vram = (uint8_t *)calloc(1, GPU_VRAM_SIZE);
+  g_gpu.framebuffer = (uint32_t *)calloc(g_width * g_height, 4);
+  g_gpu.depthbuffer = (float *)malloc(g_width * g_height * sizeof(float));
+
+  pthread_t gpu_thread;
+  pthread_create(&gpu_thread, NULL, gpu_worker_thread, NULL);
 
   const char *display_name = NULL;
 
@@ -333,6 +521,12 @@ int main() {
 
     // Mat4 mvp = mat4_mul(proj, mat4_mul(view, model));
 
+    float s = sinf(angle), c = cosf(angle);
+    Mat4 mvp = {{{c, 0, s, 0},
+                 {s * s, c, -s * c, 0},
+                 {-c * s, s, c * c, -2.5f}, // Perspective-ish translation
+                 {0, 0, 1, 0}}};
+
     g_current_mvp = mat4_mul(proj, mat4_mul(view, model));
 
     Vertex cube_buffer[36];
@@ -340,8 +534,13 @@ int main() {
       cube_buffer[i] = cube[indices[i]];
     }
 
+    // driver_emit(GPU_OP_LOAD_VP_MATRIX, 0, 0, (float *)&mvp, sizeof(mat4));
+    // glBindBuffer(vbo);
+    // glDrawArrays(24, 0x00ffaa);
+
     glDrawArrays(cube_buffer, 36);
     glFlush();
+    // driver_flush();
 
     XPutImage(display, window, gc, g_ximage, 0, 0, 0, 0, g_width, g_height);
     XFlush(display);
